@@ -1,0 +1,58 @@
+# ─── Dataset ──────────────────────────────────────────────────
+khmer-ocr-synth-v1/
+data/
+
+# ─── Checkpoints ──────────────────────────────────────────────
+checkpoints/
+checkpoints1/
+checkpoints2/
+checkpoints3/
+
+# ─── Python ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ─── Virtual environments ────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ─── IDE ──────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ─── OS ───────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── ONNX exports ────────────────────────────────────────────
+*.onnx
+
+# ─── Logs & misc ─────────────────────────────────────────────
+*.log
+wandb/
+runs/
+
+# Input
+input/
+khmer-ocr-synth-v1/
+khmer-synth14/
+
+# premodel
+model9k/
+model90k/
+
+outputkaggle/
+
+*.zip
+output100k/
+val.ipynb

@@ -1,0 +1,31 @@
+graph TD
+    subgraph Input
+        IMG[Image (Gray)] -->|Resize| H64[64xW Pixels]
+    end
+
+    subgraph Backbone [Feature Extraction (ResNet)]
+        H64 -->|ConvBlock| L1[Layer 1 (H/2, W/2)]
+        L1 -->|ResBlock| L2[Layer 2 (H/4, W/4)]
+        L2 -->|ResBlock| L3[Layer 3 (H/8, W/4)]
+        L3 -->|ResBlock| L4[Layer 4 (H/16, W/4)]
+    end
+
+    subgraph Neck [Bridge]
+        L4 -->|Flatten Height| SEQ[Sequence: T x FeatureDim]
+        SEQ -->|Linear Proj + Norm| DMODEL[T x d_model (256)]
+    end
+
+    subgraph Head [Sequence Modeling (Transformer)]
+        DMODEL -->|Positional Encoding| POS[Add PosEnc]
+        POS -->|Transformer Encoder| ENC1[Layer 1]
+        ENC1 -->|Self-Attention| ENC2[Layer 2]
+        ENC2 -->|Replaced| ENCX[... (2-4 Layers)]
+    end
+
+    subgraph Output [Prediction]
+        ENCX -->|Linear| LOGITS[Logits: T x Vocab]
+        LOGITS -->|CTC Decode| TEXT[Final Text Output]
+    end
+
+    classDef component fill:#d4e1f5,stroke:#333,stroke-width:2px;
+    class H64,L4,SEQ,DMODEL,ENC1,LOGITS component;
