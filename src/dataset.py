@@ -180,9 +180,6 @@ def build_dataloaders(
         except OSError:
             pass
 
-    _persistent = num_workers > 0
-    _prefetch   = 4 if num_workers > 0 else None
-
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -191,8 +188,6 @@ def build_dataloaders(
         collate_fn=collate_fn,
         pin_memory=pin_memory,
         drop_last=True,
-        persistent_workers=_persistent,
-        prefetch_factor=_prefetch,
     )
 
     val_loader = DataLoader(
@@ -202,8 +197,6 @@ def build_dataloaders(
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=pin_memory,
-        persistent_workers=_persistent,
-        prefetch_factor=_prefetch,
     )
 
     return train_loader, val_loader

@@ -153,7 +153,6 @@ def train_one_epoch(
     model, loader, optimizer, scheduler, device,
     blank_id, scaler, log_interval,
     epoch, total_epochs, grad_clip, accum_steps,
-    amp_dtype=torch.float16,
 ) -> float:
 
     model.train()
@@ -170,8 +169,7 @@ def train_one_epoch(
         target_lens = target_lens.to(device, non_blocking=True)
         B           = images.size(0)   # real batch size this step
 
-        use_autocast = device.type == "cuda"
-        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_autocast):
+        with torch.amp.autocast("cuda", enabled=(scaler is not None)):
             logits    = model(images)
             logits    = fix_dp_logits(logits, B)        # [T, B, V] guaranteed
             log_probs = F.log_softmax(logits, dim=-1)
@@ -317,10 +315,6 @@ def main():
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # A40/Ampere perf: TF32 matmuls + auto-tune conv kernels
-    torch.backends.cudnn.benchmark = True
-    torch.set_float32_matmul_precision("high")
-
     # Device
     if args.device:
         device = torch.device(args.device)
@@ -329,15 +323,8 @@ def main():
     else:
         device = torch.device("cpu")
 
-    use_amp  = device.type == "cuda"
-    # A40 is Ampere (sm_86): BF16 is natively fast and needs no loss scaler
-    use_bf16 = (
-        use_amp
-        and torch.cuda.get_device_capability(0)[0] >= 8
-        and hasattr(torch, "bfloat16")
-    )
-    amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
-    n_gpus    = torch.cuda.device_count() if device.type == "cuda" else 1
+    use_amp = device.type == "cuda"
+    n_gpus  = torch.cuda.device_count() if device.type == "cuda" else 1
 
     # Dataset paths
     data_dir   = Path(args.data)
@@ -390,20 +377,7 @@ def main():
         model = nn.DataParallel(model)
         print(f"  DataParallel: {n_gpus} GPUs detected and used")
 
-    # torch.compile: fuses ops, ~20-30% throughput gain on Ampere (PyTorch >= 2.0)
-    if hasattr(torch, "compile") and device.type == "cuda":
-        print("  torch.compile: enabled (first epoch will be slow for tracing)")
-        model = torch.compile(model)
-
-    raw_model = (
-        model._orig_mod.module
-        if hasattr(model, "_orig_mod") and isinstance(model._orig_mod, nn.DataParallel)
-        else model._orig_mod
-        if hasattr(model, "_orig_mod")
-        else model.module
-        if isinstance(model, nn.DataParallel)
-        else model
-    )
+    raw_model = model.module if isinstance(model, nn.DataParallel) else model
     p_info    = raw_model.count_params()
 
     # Optimizer + scheduler
@@ -421,8 +395,8 @@ def main():
         anneal_strategy = "cos",
     )
 
-    # BF16 doesn't need loss scaling; FP16 does
-    scaler = torch.amp.GradScaler("cuda") if (use_amp and not use_bf16) else None
+    # AMP GradScaler — T4 supports FP16, ~1.5-2x speedup
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
     # Resume
     start_epoch = 1
@@ -449,8 +423,7 @@ def main():
     print(f"  Device     : {device}  ({n_gpus} GPU{'s' if n_gpus > 1 else ''})")
     if gpu_names:
         print(f"  GPUs       : {gpu_names}")
-    amp_label = ("BF16" if use_bf16 else "FP16") if use_amp else "OFF"
-    print(f"  AMP        : {amp_label}")
+    print(f"  AMP FP16   : {'ON' if use_amp else 'OFF'}")
     print(f"  Backbone   : {args.backbone}  ({p_info['total_M']:.2f}M params)")
     print(f"  Vocab size : {vocab.size}")
     print(f"  Epochs     : {start_epoch} -> {args.epochs}")
@@ -480,7 +453,6 @@ def main():
                 total_epochs = args.epochs,
                 grad_clip    = args.clip,
                 accum_steps  = accum_steps,
-                amp_dtype    = amp_dtype,
             )
 
             print(f"\n  Evaluating ...")
