@@ -13,6 +13,7 @@ The model is intentionally simple and trainable on a single mid-range GPU.
 Swap the backbone for ResNet-34 or EfficientNet if you have more compute.
 """
 
+import math
 import torch
 import torch.nn as nn
 import torchvision.models as tvm
@@ -146,3 +147,178 @@ class KhmerOCRModel(nn.Module):
             "trainable": trainable,
             "total_M":   total / 1e6,
         }
+
+
+# ── OCRRecModel (ResNet → Transformer → CTC) ──────────────────────────────────
+
+class _ResBlock(nn.Module):
+    """Basic residual block with configurable spatial stride."""
+
+    def __init__(self, in_ch: int, out_ch: int, stride=(1, 1)):
+        super().__init__()
+        s = stride if isinstance(stride, tuple) else (stride, stride)
+        self.body = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, stride=s, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+        )
+        need_proj = (s != (1, 1)) or (in_ch != out_ch)
+        self.skip = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 1, stride=s, bias=False),
+            nn.BatchNorm2d(out_ch),
+        ) if need_proj else nn.Identity()
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.body(x) + self.skip(x))
+
+
+class _ResNetBackbone(nn.Module):
+    """4-stage ResNet backbone built for OCR (grayscale input).
+
+    Stride schedule (H × W):
+        stem  1×1  channels[0]
+        s1    2×1  channels[0]   — halve height, keep width
+        s2    2×1  channels[1]   — halve height, keep width
+        s3    2×2  channels[2]   — halve height, halve width
+        s4    1×1  channels[3]   — deeper features only
+
+    For target_h=48: H goes 48→24→12→6→6; W compressed 2× in s3.
+    AdaptiveAvgPool(1, None) after this gives T ≈ W/2 time steps.
+    """
+
+    def __init__(self, channels=(64, 128, 256, 256)):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(1, channels[0], 3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(channels[0]),
+            nn.ReLU(inplace=True),
+        )
+        self.s1 = _ResBlock(channels[0], channels[0], stride=(2, 1))
+        self.s2 = _ResBlock(channels[0], channels[1], stride=(2, 1))
+        self.s3 = _ResBlock(channels[1], channels[2], stride=(2, 2))
+        self.s4 = _ResBlock(channels[2], channels[3], stride=(1, 1))
+        self.out_channels = channels[3]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.size(1) == 3:  # pseudo-RGB → grayscale
+            x = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
+        x = self.stem(x)
+        x = self.s1(x)
+        x = self.s2(x)
+        x = self.s3(x)
+        x = self.s4(x)
+        return x  # [B, C, H', W']
+
+
+class _PositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding (time-first layout)."""
+
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 4096):
+        super().__init__()
+        self.drop = nn.Dropout(p=dropout)
+        pe  = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div = torch.exp(
+            torch.arange(0, d_model, 2, dtype=torch.float)
+            * (-math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe.unsqueeze(1))  # [max_len, 1, d_model]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.drop(x + self.pe[:x.size(0)])
+
+
+class OCRRecModel(nn.Module):
+    """
+    ThaoOCR recognition model.
+
+    Pipeline: [B,1,H,W] → ResNet backbone → height pool → Linear neck
+              → Positional encoding → Transformer encoder → CTC head
+              → [T,B,V]
+
+    Parameters
+    ----------
+    vocab_size         : number of output classes (CTC blank = 0)
+    backbone_channels  : (C1, C2, C3, C4) for each ResNet stage
+    d_model            : Transformer hidden dim
+    nhead              : attention heads
+    num_layers         : Transformer encoder layers
+    dim_feedforward    : FFN hidden dim inside each Transformer layer
+    neck_dropout       : dropout in Linear neck
+    head_dropout       : dropout inside Transformer layers
+    """
+
+    def __init__(
+        self,
+        vocab_size:        int,
+        backbone_channels: tuple = (64, 128, 256, 256),
+        d_model:           int   = 256,
+        nhead:             int   = 4,
+        num_layers:        int   = 4,
+        dim_feedforward:   int   = 1024,
+        neck_dropout:      float = 0.1,
+        head_dropout:      float = 0.1,
+    ):
+        super().__init__()
+        self.backbone = _ResNetBackbone(channels=backbone_channels)
+        c_in = self.backbone.out_channels
+
+        self.pool = nn.AdaptiveAvgPool2d((1, None))  # collapse height → 1
+
+        self.neck = nn.Sequential(
+            nn.Linear(c_in, d_model),
+            nn.LayerNorm(d_model),
+            nn.Dropout(neck_dropout),
+        )
+
+        self.pos_enc = _PositionalEncoding(d_model, dropout=head_dropout)
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model        = d_model,
+            nhead          = nhead,
+            dim_feedforward= dim_feedforward,
+            dropout        = head_dropout,
+            batch_first    = False,   # time-first [T, B, d_model]
+            norm_first     = True,    # pre-norm: more stable training
+        )
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.head = nn.Linear(d_model, vocab_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x : [B, 1, H, W]
+        returns [T, B, V] — time-first logits for CTC loss
+        """
+        feat = self.backbone(x)       # [B, C, H', W']
+        feat = self.pool(feat)        # [B, C,  1, W']
+        feat = feat.squeeze(2)        # [B, C, W']
+        feat = feat.permute(0, 2, 1)  # [B, T, C]
+        feat = self.neck(feat)        # [B, T, d_model]
+        feat = feat.permute(1, 0, 2)  # [T, B, d_model]
+        feat = self.pos_enc(feat)
+        feat = self.transformer(feat) # [T, B, d_model]
+        return self.head(feat)        # [T, B, V]
+
+    @classmethod
+    def from_config(cls, cfg, vocab_size: int) -> "OCRRecModel":
+        """Instantiate from a ModelConfig object (config.py)."""
+        return cls(
+            vocab_size        = vocab_size,
+            backbone_channels = tuple(cfg.backbone.channels),
+            d_model           = cfg.head.d_model,
+            nhead             = cfg.head.nhead,
+            num_layers        = cfg.head.num_layers,
+            dim_feedforward   = cfg.head.dim_feedforward,
+            neck_dropout      = cfg.neck.dropout,
+            head_dropout      = cfg.head.dropout,
+        )
+
+    def count_params(self) -> dict:
+        total     = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return {"total": total, "trainable": trainable, "total_M": total / 1e6}
